@@ -44,18 +44,76 @@ enum PolicyAction: Equatable {
     case apply(CoolingTarget)
 }
 
+struct TemperatureThresholds: Equatable {
+    var off: Double
+    var low: Double
+    var medium: Double
+    var high: Double
+
+    static let standard = TemperatureThresholds(off: 55, low: 60, medium: 70, high: 80)
+
+    var isValid: Bool {
+        (0...120).contains(off) && off < low && low < medium && medium < high && high <= 120
+    }
+}
+
+struct AutomationTimings: Equatable {
+    var confirmationDelay: TimeInterval
+    var shutdownDelay: TimeInterval
+    var sampleInterval: TimeInterval
+
+    static let standard = AutomationTimings(
+        confirmationDelay: 10,
+        shutdownDelay: 60,
+        sampleInterval: 30
+    )
+
+    var isValid: Bool {
+        (1...3600).contains(confirmationDelay) &&
+        (1...3600).contains(shutdownDelay) &&
+        (1...3600).contains(sampleInterval)
+    }
+}
+
 struct AutoPolicy {
     private(set) var currentTarget: CoolingTarget = .off
     private(set) var pendingTarget: CoolingTarget?
+    private(set) var thresholds: TemperatureThresholds
+    private(set) var timings: AutomationTimings
     private var pendingSince: TimeInterval?
     private var lowSince: TimeInterval?
 
-    static func candidate(for temperature: Double) -> CoolingTarget? {
-        if temperature >= 80 { return .high }
-        if temperature >= 70 { return .medium }
-        if temperature >= 60 { return .low }
-        if temperature <= 55 { return .off }
+    init(
+        thresholds: TemperatureThresholds = .standard,
+        timings: AutomationTimings = .standard
+    ) {
+        self.thresholds = thresholds.isValid ? thresholds : .standard
+        self.timings = timings.isValid ? timings : .standard
+    }
+
+    static func candidate(
+        for temperature: Double,
+        thresholds: TemperatureThresholds = .standard
+    ) -> CoolingTarget? {
+        if temperature >= thresholds.high { return .high }
+        if temperature >= thresholds.medium { return .medium }
+        if temperature >= thresholds.low { return .low }
+        if temperature <= thresholds.off { return .off }
         return nil
+    }
+
+    mutating func updateThresholds(_ thresholds: TemperatureThresholds) {
+        guard thresholds.isValid else { return }
+        self.thresholds = thresholds
+        cancelPending()
+        lowSince = nil
+    }
+
+    mutating func updateTimings(_ timings: AutomationTimings) {
+        guard timings.isValid else { return }
+        self.timings = timings
+        cancelPending()
+        lowSince = nil
     }
 
     mutating func synchronizeCurrent(to target: CoolingTarget) {
@@ -70,10 +128,10 @@ struct AutoPolicy {
     }
 
     mutating func process(temperature: Double, at now: TimeInterval, confirmation: Bool = false) -> PolicyAction {
-        if temperature <= 55 {
+        if temperature <= thresholds.off {
             cancelPending()
             if lowSince == nil { lowSince = now }
-            if now - (lowSince ?? now) >= 60, currentTarget != .off {
+            if now - (lowSince ?? now) >= timings.shutdownDelay, currentTarget != .off {
                 currentTarget = .off
                 lowSince = nil
                 return .apply(.off)
@@ -82,7 +140,7 @@ struct AutoPolicy {
         }
 
         lowSince = nil
-        guard let candidate = Self.candidate(for: temperature), candidate != .off else {
+        guard let candidate = Self.candidate(for: temperature, thresholds: thresholds), candidate != .off else {
             cancelPending()
             return .none
         }
@@ -95,7 +153,7 @@ struct AutoPolicy {
         if confirmation,
            pendingTarget == candidate,
            let pendingSince,
-           now - pendingSince >= 10 {
+           now - pendingSince >= timings.confirmationDelay {
             currentTarget = candidate
             cancelPending()
             return .apply(candidate)
@@ -104,7 +162,7 @@ struct AutoPolicy {
         if pendingTarget != candidate {
             pendingTarget = candidate
             pendingSince = now
-            return .confirm(candidate, after: 10)
+            return .confirm(candidate, after: timings.confirmationDelay)
         }
 
         return .none

@@ -235,7 +235,7 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
 final class TemperatureAutomation {
     private let ble: BLEManager
-    private var policy = AutoPolicy()
+    private var policy: AutoPolicy
     private var regularTimer: Timer?
     private var confirmationTimer: Timer?
     private var displayTimer: Timer?
@@ -249,13 +249,29 @@ final class TemperatureAutomation {
 
     init(ble: BLEManager) {
         self.ble = ble
-        mode = ControlMode(rawValue: UserDefaults.standard.integer(forKey: "controlMode")) ?? .automatic
+        let defaults = UserDefaults.standard
+        mode = ControlMode(rawValue: defaults.integer(forKey: "controlMode")) ?? .automatic
+        let savedThresholds = TemperatureThresholds(
+            off: defaults.object(forKey: "thresholdOff") as? Double ?? TemperatureThresholds.standard.off,
+            low: defaults.object(forKey: "thresholdLow") as? Double ?? TemperatureThresholds.standard.low,
+            medium: defaults.object(forKey: "thresholdMedium") as? Double ?? TemperatureThresholds.standard.medium,
+            high: defaults.object(forKey: "thresholdHigh") as? Double ?? TemperatureThresholds.standard.high
+        )
+        let savedTimings = AutomationTimings(
+            confirmationDelay: defaults.object(forKey: "confirmationDelay") as? Double ?? AutomationTimings.standard.confirmationDelay,
+            shutdownDelay: defaults.object(forKey: "shutdownDelay") as? Double ?? AutomationTimings.standard.shutdownDelay,
+            sampleInterval: defaults.object(forKey: "sampleInterval") as? Double ?? AutomationTimings.standard.sampleInterval
+        )
+        policy = AutoPolicy(thresholds: savedThresholds, timings: savedTimings)
     }
+
+    var thresholds: TemperatureThresholds { policy.thresholds }
+    var timings: AutomationTimings { policy.timings }
 
     func start() {
         scheduleRegularTimer()
         displayTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            self?.updateTimingDisplay()
+            self?.refreshDisplay()
         }
         applyMode(sampleImmediately: true)
     }
@@ -270,6 +286,33 @@ final class TemperatureAutomation {
         self.mode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "controlMode")
         applyMode(sampleImmediately: true)
+    }
+
+    func setThresholds(_ thresholds: TemperatureThresholds) -> Bool {
+        guard thresholds.isValid else { return false }
+        policy.updateThresholds(thresholds)
+        let defaults = UserDefaults.standard
+        defaults.set(thresholds.off, forKey: "thresholdOff")
+        defaults.set(thresholds.low, forKey: "thresholdLow")
+        defaults.set(thresholds.medium, forKey: "thresholdMedium")
+        defaults.set(thresholds.high, forKey: "thresholdHigh")
+        if mode == .automatic { sample(confirmation: false) }
+        return true
+    }
+
+    func setTimings(_ timings: AutomationTimings) -> Bool {
+        guard timings.isValid else { return false }
+        confirmationTimer?.invalidate()
+        confirmationTimer = nil
+        confirmationDue = nil
+        policy.updateTimings(timings)
+        let defaults = UserDefaults.standard
+        defaults.set(timings.confirmationDelay, forKey: "confirmationDelay")
+        defaults.set(timings.shutdownDelay, forKey: "shutdownDelay")
+        defaults.set(timings.sampleInterval, forKey: "sampleInterval")
+        scheduleRegularTimer()
+        if mode == .automatic { sample(confirmation: false) }
+        return true
     }
 
     private func applyMode(sampleImmediately: Bool) {
@@ -289,10 +332,11 @@ final class TemperatureAutomation {
 
     private func scheduleRegularTimer() {
         regularTimer?.invalidate()
-        nextRegularSample = Date().addingTimeInterval(30)
-        regularTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        let interval = policy.timings.sampleInterval
+        nextRegularSample = Date().addingTimeInterval(interval)
+        regularTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.nextRegularSample = Date().addingTimeInterval(30)
+            self.nextRegularSample = Date().addingTimeInterval(self.policy.timings.sampleInterval)
             self.sample(confirmation: false)
         }
     }
@@ -321,6 +365,12 @@ final class TemperatureAutomation {
         handle(action)
     }
 
+    private func refreshDisplay() {
+        let temperature = mc_cpu_average_temperature()
+        onTemperature?(temperature.isFinite ? temperature : nil)
+        updateTimingDisplay()
+    }
+
     private func handle(_ action: PolicyAction) {
         switch action {
         case .none:
@@ -332,7 +382,7 @@ final class TemperatureAutomation {
         case let .confirm(target, delay):
             confirmationTimer?.invalidate()
             confirmationDue = Date().addingTimeInterval(delay)
-            onAutomationStatus?("温度达到\(target.displayName)阈值，10 秒后确认")
+            onAutomationStatus?("温度达到\(target.displayName)阈值，\(formatSeconds(delay))后确认")
             confirmationTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
                 self?.confirmationTimer = nil
                 self?.sample(confirmation: true)
@@ -342,7 +392,7 @@ final class TemperatureAutomation {
             confirmationTimer = nil
             confirmationDue = nil
             ble.setTarget(target)
-            onAutomationStatus?(target == .off ? "低温持续 60 秒，已关闭制冷" : "自动切换到\(target.displayName)")
+            onAutomationStatus?(target == .off ? "低温持续 \(formatSeconds(policy.timings.shutdownDelay))，已关闭制冷" : "自动切换到\(target.displayName)")
         }
         updateTimingDisplay()
     }
@@ -358,6 +408,10 @@ final class TemperatureAutomation {
             onTiming?("等待采样")
         }
     }
+
+    private func formatSeconds(_ value: TimeInterval) -> String {
+        value.rounded() == value ? "\(Int(value)) 秒" : String(format: "%.1f 秒", value)
+    }
 }
 
 final class ControllerViewController: NSViewController {
@@ -371,6 +425,16 @@ final class ControllerViewController: NSViewController {
     private let timingLabel = NSTextField(labelWithString: "等待采样")
     private let modeControl = NSSegmentedControl(labels: ["自动", "强制开启", "强制关闭"], trackingMode: .selectOne, target: nil, action: nil)
     private let bluetoothSwitch = NSSwitch()
+    private let offField = NSTextField()
+    private let lowField = NSTextField()
+    private let mediumField = NSTextField()
+    private let highField = NSTextField()
+    private let confirmationDelayField = NSTextField()
+    private let shutdownDelayField = NSTextField()
+    private let sampleIntervalField = NSTextField()
+    private let rulesLabel = NSTextField(wrappingLabelWithString: "")
+    private let thresholdStatusLabel = NSTextField(labelWithString: "")
+    private let timingSettingsStatusLabel = NSTextField(labelWithString: "")
 
     init(ble: BLEManager, automation: TemperatureAutomation) {
         self.ble = ble
@@ -409,9 +473,43 @@ final class ControllerViewController: NSViewController {
         connectionRow.distribution = .fill
         connectionRow.spacing = 12
 
-        let rules = NSTextField(wrappingLabelWithString: "自动规则：≥60°C 低档 · ≥70°C 中档 · ≥80°C 高档（持续 10 秒确认）\n≤55°C 持续 60 秒关闭 · 常规每 30 秒采样")
-        rules.textColor = .secondaryLabelColor
-        rules.font = .systemFont(ofSize: 12)
+        let thresholdsTitle = NSTextField(labelWithString: "自动温度设置")
+        thresholdsTitle.font = .boldSystemFont(ofSize: 14)
+        configureThresholdField(offField, value: automation.thresholds.off)
+        configureThresholdField(lowField, value: automation.thresholds.low)
+        configureThresholdField(mediumField, value: automation.thresholds.medium)
+        configureThresholdField(highField, value: automation.thresholds.high)
+        let thresholdRow = NSStackView(views: [
+            NSTextField(labelWithString: "关闭 ≤"), offField,
+            NSTextField(labelWithString: "低档 ≥"), lowField,
+            NSTextField(labelWithString: "中档 ≥"), mediumField,
+            NSTextField(labelWithString: "高档 ≥"), highField,
+            button("保存", #selector(saveThresholds))
+        ])
+        thresholdRow.orientation = .horizontal
+        thresholdRow.spacing = 7
+        rulesLabel.textColor = .secondaryLabelColor
+        rulesLabel.font = .systemFont(ofSize: 12)
+        thresholdStatusLabel.textColor = .secondaryLabelColor
+        thresholdStatusLabel.font = .systemFont(ofSize: 12)
+
+        let timingsTitle = NSTextField(labelWithString: "自动时间设置")
+        timingsTitle.font = .boldSystemFont(ofSize: 14)
+        configureTimingField(confirmationDelayField, value: automation.timings.confirmationDelay)
+        configureTimingField(shutdownDelayField, value: automation.timings.shutdownDelay)
+        configureTimingField(sampleIntervalField, value: automation.timings.sampleInterval)
+        let timingSettingsRow = NSStackView(views: [
+            NSTextField(labelWithString: "切档确认"), confirmationDelayField,
+            NSTextField(labelWithString: "关闭等待"), shutdownDelayField,
+            NSTextField(labelWithString: "采样间隔"), sampleIntervalField,
+            NSTextField(labelWithString: "秒"),
+            button("保存", #selector(saveTimings))
+        ])
+        timingSettingsRow.orientation = .horizontal
+        timingSettingsRow.spacing = 8
+        timingSettingsStatusLabel.textColor = .secondaryLabelColor
+        timingSettingsStatusLabel.font = .systemFont(ofSize: 12)
+        updateRulesLabel(automation.thresholds, timings: automation.timings)
 
         let lightsTitle = NSTextField(labelWithString: "灯效")
         lightsTitle.font = .boldSystemFont(ofSize: 14)
@@ -432,7 +530,9 @@ final class ControllerViewController: NSViewController {
 
         let stack = NSStackView(views: [
             title, temperatureLabel, connectionRow, modeControl,
-            targetLabel, automationLabel, timingLabel, rules,
+            targetLabel, automationLabel, timingLabel,
+            thresholdsTitle, thresholdRow, thresholdStatusLabel,
+            timingsTitle, timingSettingsRow, timingSettingsStatusLabel, rulesLabel,
             separator, lightsTitle, lightRow
         ])
         stack.orientation = .vertical
@@ -443,12 +543,14 @@ final class ControllerViewController: NSViewController {
 
         NSLayoutConstraint.activate([
             view.widthAnchor.constraint(equalToConstant: 620),
-            view.heightAnchor.constraint(equalToConstant: 430),
+            view.heightAnchor.constraint(equalToConstant: 610),
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
             stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 24),
             modeControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
             connectionRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            thresholdRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            timingSettingsRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             lightRow.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
@@ -467,6 +569,30 @@ final class ControllerViewController: NSViewController {
         return button
     }
 
+    private func configureThresholdField(_ field: NSTextField, value: Double) {
+        field.stringValue = formatThreshold(value)
+        field.alignment = .center
+        field.target = self
+        field.action = #selector(saveThresholds)
+        field.widthAnchor.constraint(equalToConstant: 48).isActive = true
+    }
+
+    private func configureTimingField(_ field: NSTextField, value: TimeInterval) {
+        field.stringValue = formatThreshold(value)
+        field.alignment = .center
+        field.target = self
+        field.action = #selector(saveTimings)
+        field.widthAnchor.constraint(equalToConstant: 52).isActive = true
+    }
+
+    private func formatThreshold(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
+    }
+
+    private func updateRulesLabel(_ thresholds: TemperatureThresholds, timings: AutomationTimings) {
+        rulesLabel.stringValue = "当前规则：≥\(formatThreshold(thresholds.low))°C 低档 · ≥\(formatThreshold(thresholds.medium))°C 中档 · ≥\(formatThreshold(thresholds.high))°C 高档（持续 \(formatThreshold(timings.confirmationDelay)) 秒确认）\n≤\(formatThreshold(thresholds.off))°C 持续 \(formatThreshold(timings.shutdownDelay)) 秒关闭 · 自动控制每 \(formatThreshold(timings.sampleInterval)) 秒采样"
+    }
+
     @objc private func modeChanged() {
         guard let mode = ControlMode(rawValue: modeControl.selectedSegment) else { return }
         automation.setMode(mode)
@@ -474,6 +600,61 @@ final class ControllerViewController: NSViewController {
 
     @objc private func bluetoothSearchChanged() {
         ble.setSearchEnabled(bluetoothSwitch.state == .on)
+    }
+
+    @objc private func saveThresholds() {
+        guard
+            let off = Double(offField.stringValue),
+            let low = Double(lowField.stringValue),
+            let medium = Double(mediumField.stringValue),
+            let high = Double(highField.stringValue)
+        else {
+            thresholdStatusLabel.stringValue = "请输入有效数字"
+            thresholdStatusLabel.textColor = .systemRed
+            NSSound.beep()
+            return
+        }
+
+        let thresholds = TemperatureThresholds(off: off, low: low, medium: medium, high: high)
+        guard automation.setThresholds(thresholds) else {
+            thresholdStatusLabel.stringValue = "请保证：关闭 < 低档 < 中档 < 高档（0–120°C）"
+            thresholdStatusLabel.textColor = .systemRed
+            NSSound.beep()
+            return
+        }
+
+        thresholdStatusLabel.stringValue = "已保存"
+        thresholdStatusLabel.textColor = .systemGreen
+        updateRulesLabel(thresholds, timings: automation.timings)
+    }
+
+    @objc private func saveTimings() {
+        guard
+            let confirmationDelay = Double(confirmationDelayField.stringValue),
+            let shutdownDelay = Double(shutdownDelayField.stringValue),
+            let sampleInterval = Double(sampleIntervalField.stringValue)
+        else {
+            timingSettingsStatusLabel.stringValue = "请输入有效秒数"
+            timingSettingsStatusLabel.textColor = .systemRed
+            NSSound.beep()
+            return
+        }
+
+        let timings = AutomationTimings(
+            confirmationDelay: confirmationDelay,
+            shutdownDelay: shutdownDelay,
+            sampleInterval: sampleInterval
+        )
+        guard automation.setTimings(timings) else {
+            timingSettingsStatusLabel.stringValue = "每项请输入 1–3600 秒"
+            timingSettingsStatusLabel.textColor = .systemRed
+            NSSound.beep()
+            return
+        }
+
+        timingSettingsStatusLabel.stringValue = "已保存并立即生效"
+        timingSettingsStatusLabel.textColor = .systemGreen
+        updateRulesLabel(automation.thresholds, timings: timings)
     }
 
     @objc private func reconnectTapped() { ble.reconnect() }
